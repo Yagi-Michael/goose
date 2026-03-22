@@ -889,8 +889,11 @@ async fn test_codex_acp_provider() -> Result<()> {
 // Requires: npm install -g @google/gemini-cli
 #[tokio::test]
 async fn test_gemini_acp_provider() -> Result<()> {
-    ProviderTestConfig::with_agentic_provider("gemini-acp", ACP_CURRENT_MODEL, "gemini")
-        .model_switch_name("auto-gemini-2.5")
+    // Don't run tests with ACP_CURRENT_MODEL, as gemini sets "auto-gemini-3" even when the user
+    // has no access to the Preview Release Channel, resulting in "Requested entity was not found."
+    // See https://github.com/google-gemini/gemini-cli/issues/22803
+    ProviderTestConfig::with_agentic_provider("gemini-acp", "auto-gemini-2.5", "gemini")
+        .model_switch_name("gemini-2.5-flash")
         .run()
         .await
 }

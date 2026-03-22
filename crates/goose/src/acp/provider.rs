@@ -1,6 +1,7 @@
 use agent_client_protocol_schema::AGENT_METHOD_NAMES;
 use anyhow::{Context, Result};
 use async_stream::try_stream;
+use futures::future::BoxFuture;
 use rmcp::model::{Role, Tool};
 use sacp::schema::{
     AuthMethod, CloseSessionRequest, ContentBlock, ContentChunk, EnvVariable, HttpHeader,
@@ -88,6 +89,17 @@ enum ClientRequest {
     },
 }
 
+// tokio I/O handles can't move between runtimes, so the child process must be
+// spawned inside the OS thread. This closure lets start() share all other logic.
+type ClientLoopFn = Box<
+    dyn FnOnce(
+            AcpClientLoop,
+            mpsc::Receiver<ClientRequest>,
+            oneshot::Sender<Result<InitializeResponse>>,
+        ) -> BoxFuture<'static, ()>
+        + Send,
+>;
+
 #[derive(Debug)]
 enum AcpUpdate {
     Text(String),
@@ -112,7 +124,6 @@ pub struct AcpProvider {
     goose_mode: Arc<Mutex<GooseMode>>,
     tx: Option<mpsc::Sender<ClientRequest>>,
     loop_thread: Option<JoinHandle<()>>,
-    _child: Option<Child>,
     mode_mapping: HashMap<GooseMode, String>,
     permission_mapping: PermissionMapping,
     rejected_tool_calls: Arc<TokioMutex<HashSet<String>>>,
@@ -155,16 +166,17 @@ impl AcpProvider {
         goose_mode: GooseMode,
         config: AcpProviderConfig,
     ) -> Result<Self> {
-        let mut child = spawn_acp_process(&config).await?;
-        let stdin = child.stdin.take().context("no stdin")?;
-        let stdout = child.stdout.take().context("no stdout")?;
-        let transport = sacp::ByteStreams::new(stdin.compat_write(), stdout.compat());
-        let mut provider =
-            Self::connect_with_transport(name, model, goose_mode, config, transport).await?;
-        provider._child = Some(child);
-        Ok(provider)
+        Self::start(
+            name,
+            model,
+            goose_mode,
+            config,
+            Box::new(|cl, rx, init_tx| Box::pin(cl.spawn(rx, init_tx))),
+        )
+        .await
     }
 
+    #[doc(hidden)]
     pub async fn connect_with_transport(
         name: String,
         model: ModelConfig,
@@ -172,18 +184,37 @@ impl AcpProvider {
         config: AcpProviderConfig,
         transport: impl sacp::ConnectTo<Client> + 'static,
     ) -> Result<Self> {
-        let (tx, mut rx) = mpsc::channel(32);
+        Self::start(
+            name,
+            model,
+            goose_mode,
+            config,
+            Box::new(move |cl, mut rx, init_tx| {
+                Box::pin(async move {
+                    if let Err(e) = cl.run(transport, &mut rx, init_tx).await {
+                        tracing::error!("ACP protocol error: {e}");
+                    }
+                })
+            }),
+        )
+        .await
+    }
+
+    async fn start(
+        name: String,
+        model: ModelConfig,
+        goose_mode: GooseMode,
+        config: AcpProviderConfig,
+        run: ClientLoopFn,
+    ) -> Result<Self> {
+        let (tx, rx) = mpsc::channel(32);
         let (init_tx, init_rx) = oneshot::channel();
         let mode_mapping = config.mode_mapping.clone();
         let permission_mapping = config.permission_mapping.clone();
         let rejected_tool_calls = Arc::new(TokioMutex::new(HashSet::new()));
         let goose_mode = Arc::new(Mutex::new(goose_mode));
         let client_loop = AcpClientLoop::new(config, goose_mode.clone());
-        let loop_thread = spawn_client_loop(async move {
-            if let Err(e) = client_loop.run(transport, &mut rx, init_tx).await {
-                tracing::error!("ACP protocol error: {e}");
-            }
-        });
+        let loop_thread = spawn_client_loop(run(client_loop, rx, init_tx));
 
         let init_response = init_rx
             .await
@@ -239,7 +270,6 @@ impl AcpProvider {
             goose_mode,
             tx: Some(tx),
             loop_thread: Some(loop_thread),
-            _child: None,
             mode_mapping,
             permission_mapping,
             rejected_tool_calls,
@@ -724,6 +754,38 @@ impl AcpClientLoop {
             goose_mode,
             prompt_response_tx: Arc::new(Mutex::new(None)),
         }
+    }
+
+    async fn spawn(
+        self,
+        mut rx: mpsc::Receiver<ClientRequest>,
+        init_tx: oneshot::Sender<Result<InitializeResponse>>,
+    ) {
+        let child = match spawn_acp_process(&self.config).await {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = init_tx.send(Err(anyhow::anyhow!("{e}")));
+                tracing::error!("failed to spawn ACP process: {e}");
+                return;
+            }
+        };
+
+        match self.run_with_child(child, &mut rx, init_tx).await {
+            Ok(()) => tracing::debug!("ACP protocol loop exited cleanly"),
+            Err(e) => tracing::error!(error = %e, "ACP protocol loop error"),
+        }
+    }
+
+    async fn run_with_child(
+        self,
+        mut child: Child,
+        rx: &mut mpsc::Receiver<ClientRequest>,
+        init_tx: oneshot::Sender<Result<InitializeResponse>>,
+    ) -> Result<()> {
+        let stdin = child.stdin.take().context("no stdin")?;
+        let stdout = child.stdout.take().context("no stdout")?;
+        let transport = sacp::ByteStreams::new(stdin.compat_write(), stdout.compat());
+        self.run(transport, rx, init_tx).await
     }
 
     async fn run(
